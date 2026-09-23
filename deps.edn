@@ -1,0 +1,26 @@
+{:paths ["src" "resources"]
+ ;; Base deps: HTTP transport only (no Datomic, no AWS).
+ :deps {org.clojure/clojure {:mvn/version "1.12.4"}
+        com.cnuernber/charred {:mvn/version "1.037"}}
+ :aliases
+ {;; Optional Datomic peer transport: PATTERNQ_TRANSPORT=peer and
+  ;; PATTERNQ_DATOMIC_URI (storage base URI), plus credentials for the storage.
+  :peer {:extra-deps {com.datomic/peer {:mvn/version "1.0.7705"
+                                        :exclusions [org.slf4j/jul-to-slf4j]}
+                      ;; DynamoDB storage protocol support for the peer
+                      software.amazon.awssdk/dynamodb {:mvn/version "2.44.2"}
+                      ;; avoids netty conflict errors with the peer
+                      org.apache.activemq/artemis-core-client {:mvn/version "2.31.2"}
+                      ch.qos.logback/logback-classic {:mvn/version "1.5.16"}}
+         :extra-paths ["peer-resources"]
+         :jvm-opts ["--enable-native-access=ALL-UNNAMED"]}
+  :test {:extra-paths ["test"]
+         :jvm-opts ["--enable-native-access=ALL-UNNAMED"]
+         :extra-deps {io.github.cognitect-labs/test-runner
+                      {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+         :main-opts ["-m" "cognitect.test-runner"]
+         :exec-fn cognitect.test-runner.api/test}
+  :fastmath {:extra-deps {generateme/fastmath {:mvn/version "2.4.0"
+                                               :exclusions [com.github.haifengl/smile-mkl]}}}
+  :examples {:extra-paths ["templates" "examples"]
+             :extra-deps {org.scicloj/clay {:mvn/version "2.0.5"}}}}}
