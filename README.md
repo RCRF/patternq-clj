@@ -56,6 +56,13 @@ To use the peer, add the alias to your command (or copy its deps):
 PATTERNQ_TRANSPORT=peer PATTERNQ_DATOMIC_URI=<storage base uri> clojure -M:peer ...
 ```
 
+Peer connections are always read-only: `patternq.db/db-uri` adds
+`read-only=true` to the connection URI (Datomic Pro 1.0.7622+), so the peer
+reads storage directly, cannot transact, and needs no running transactor
+(except for dev storage). Read-only connections are not live: each database
+value is the state when the connection was made, so call
+`(patternq.db/release! db-name)` in a long-running process to see newer data.
+
 Differences between transports: the query service restricts expression
 functions to a whitelist (comparisons, arithmetic, `str`, `re-find`,
 `ground`, `get-else`, `missing?`, ...) and cannot take string literals that

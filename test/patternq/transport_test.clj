@@ -33,6 +33,20 @@
     (is (= "$" (first (get-in (http/query->wire '{:find [?x] :in [?y] :where [[?y :a/b ?x]]} ["v"])
                               ["query" ":in"]))))))
 
+(deftest read-only-peer-uris
+  ;; placeholder schemes: real storage URIs never appear in this repo
+  (is (= "datomic:store://h/t/db?read-only=true" (pdb/read-only-uri "datomic:store://h/t/db")))
+  (is (= "datomic:store://h/db?password=p&read-only=true" (pdb/read-only-uri "datomic:store://h/db?password=p")))
+  (is (= "datomic:store://h/t/db?read-only=true" (pdb/read-only-uri "datomic:store://h/t/db?read-only=true")))
+  (is (= "datomic:backup:file:/b?t=1" (pdb/read-only-uri "datomic:backup:file:/b?t=1")))
+  (is (thrown? clojure.lang.ExceptionInfo (pdb/read-only-uri "datomic:sql:placeholder")))
+  (let [uri (pdb/base-uri)]
+    (try
+      (pdb/set-base-uri! "datomic:store://h/t")
+      (is (= "datomic:store://h/t/H37001?read-only=true" (pdb/db-uri "H37001")))
+      (is (thrown? clojure.lang.ExceptionInfo (pdb/db-uri "admin-db-1")))
+      (finally (pdb/set-base-uri! uri)))))
+
 (deftest transport-selection
   (let [orig (pdb/transport)]
     (try

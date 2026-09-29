@@ -76,14 +76,39 @@
   []
   (boolean (try (requiring-resolve 'datomic.api/q) (catch Exception _ nil))))
 
+(defn read-only-uri
+  "Datomic connection URI with the read-only=true query parameter (Datomic
+  Pro 1.0.7622+): the connection reads storage directly, cannot transact and
+  needs no transactor (except dev storage, whose storage services run in the
+  transactor). Backup URIs are already read-only; in-memory URIs have no
+  storage and are returned as is. SQL storage URIs are not supported."
+  [uri]
+  (cond
+    (re-find #"[?&]read-only=true(&|$)" uri) uri
+    (clojure.string/starts-with? uri "datomic:backup:") uri
+    (clojure.string/starts-with? uri "datomic:mem:") uri
+    (clojure.string/starts-with? uri "datomic:sql")
+    (throw (ex-info "patternq does not support read-only SQL storage URIs." {:patternq/error :sql-storage}))
+    (clojure.string/includes? uri "?") (str uri "&read-only=true")
+    :else (str uri "?read-only=true")))
+
 (defn db-uri
+  "Read-only connection URI for the dataset database `db-name`."
   [db-name]
   (when (= admin-db-name db-name)
     (throw (ex-info "patternq does not access the admin database." {:db-name db-name})))
   (if-let [base (base-uri)]
-    (str base db-name)
+    (read-only-uri (str base db-name))
     (throw (ex-info "Peer transport needs the storage base URI: set PATTERNQ_DATOMIC_URI (or patternq.db/set-base-uri!)."
                     {:patternq/error :peer-uri-unset}))))
+
+(defn release!
+  "Release the peer's read-only connection to `db-name`. Read-only
+  connections are not live: every db from one is the state at connect time,
+  so release to see newer data (the next `db` reconnects)."
+  [db-name]
+  ((peer-fn 'release) ((peer-fn 'connect) (db-uri db-name)))
+  nil)
 
 ;; -- HTTP handle --
 

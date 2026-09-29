@@ -14,7 +14,7 @@
 (def forbidden-peer
   #"\b(d|datomic\.api)/(transact|transact-async|create-database|delete-database|rename-database|request-index|gc-storage|sync-excise)\b|\"(transact|transact-async|create-database|delete-database|rename-database|request-index|gc-storage|sync-excise)\"")
 
-(def peer-whitelist #{"q" "connect" "db" "pull" "pull-many" "basis-t"})
+(def peer-whitelist #{"q" "connect" "db" "pull" "pull-many" "basis-t" "release"})
 
 (deftest no-state-changing-datomic-calls
   (doseq [[path src] (sources)]
