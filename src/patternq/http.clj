@@ -141,6 +141,35 @@
   "Recompute and overwrite the cached result."
   false)
 
+(def ^:dynamic *format*
+  "Response format for HTTP queries: :json (default), :transit+json or
+  :transit+msgpack. The transit formats are always direct (they skip the S3
+  cache whatever *cache* says) and need com.cognitect/transit-clj on the
+  classpath (the :transit alias). Results are closer to the Datomic peer's
+  than JSON's: instants are java.util.Date instead of ISO strings, float
+  attributes (e.g. TPM) keep their stored 32-bit value with :transit+msgpack,
+  and strings that look like keywords stay strings. Bind it around any query
+  or canned function:
+
+    (binding [patternq.http/*format* :transit+json]
+      (patternq.dataset/samples db))"
+  :json)
+
+(def ^:private transit-accept
+  {:transit+json "application/transit+json"
+   :transit+msgpack "application/transit+msgpack"})
+
+(defn- read-transit
+  "Decode a transit response body (needs transit-clj, resolved at runtime so
+  it stays optional)."
+  [^bytes body fmt]
+  (let [reader (try (requiring-resolve 'cognitect.transit/reader)
+                    (catch java.io.FileNotFoundException e
+                      (throw (ex-info "transit formats need com.cognitect/transit-clj on the classpath (the :transit alias)"
+                                      {:format fmt} e))))
+        read (requiring-resolve 'cognitect.transit/read)]
+    (read (reader (ByteArrayInputStream. body) (if (= fmt :transit+msgpack) :msgpack :json)))))
+
 (defn- wire
   "Clojure Datalog data -> JSON wire form."
   [x]
@@ -208,9 +237,33 @@
       (seq args) (assoc "args" (wire (vec args)))
       *refresh-cache* (assoc "refresh-cache" true))))
 
-(defn q
-  "Run a query (map form) against an HTTP database handle
-  (patternq.db.HttpDb) with args; see patternq.db/q."
+(defn- q-transit
+  "Run a query with a transit response format (see *format*)."
+  [query db args fmt]
+  (let [accept (or (transit-accept fmt)
+                   (throw (ex-info (str "*format* must be :json, :transit+json or :transit+msgpack, not " fmt) {:format fmt})))
+        body (json/write-json-str (query->wire query args))
+        [_ reshape] (find-shape (:find query))
+        req (-> (HttpRequest/newBuilder (URI. (str (endpoint) "/query/" (:db-name db))))
+                (.header "Authorization" (str "Bearer " (api-token)))
+                (.header "Accept" accept)
+                (.header "Content-Type" "application/json")
+                (.timeout (Duration/ofMillis (+ (long *timeout-ms*) 60000)))
+                (.POST (HttpRequest$BodyPublishers/ofString body))
+                (.build))
+        ^HttpResponse resp (send! req (HttpResponse$BodyHandlers/ofByteArray))
+        ^bytes bs (.body resp)
+        transit? (str/starts-with? (.orElse (.firstValue (.headers resp) "Content-Type") "") "application/transit")]
+    (when-not (= 200 (.statusCode resp))
+      (throw (ex-info (str "Query failed (HTTP " (.statusCode resp) "): " (String. bs "UTF-8"))
+                      {:status (.statusCode resp) :body (String. bs "UTF-8") :db (:db-name db)})))
+    (let [res (if transit? (read-transit bs fmt) (json/read-json (String. bs "UTF-8")))]
+      (when-let [err (get res "error")]
+        (throw (ex-info (str "Query error: " err) {:db (:db-name db) :error err})))
+      (reset! (:basis-t db) (get res "basis_t"))
+      (reshape (cond-> (get res "query_result") (not transit?) from-wire)))))
+
+(defn- q-json
   [query db args]
   (let [body (json/write-json-str (query->wire query args))
         [_ reshape] (find-shape (:find query))
@@ -235,3 +288,12 @@
         (throw (ex-info (str "Query error: " err) {:db (:db-name db) :error err})))
       (reset! (:basis-t db) (get res "basis_t"))
       (reshape (from-wire (get res "query_result"))))))
+
+(defn q
+  "Run a query (map form) against an HTTP database handle
+  (patternq.db.HttpDb) with args; see patternq.db/q. *format* selects the
+  response format."
+  [query db args]
+  (if (not= :json *format*)
+    (q-transit query db args *format*)
+    (q-json query db args)))

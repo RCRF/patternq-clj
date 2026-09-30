@@ -14,10 +14,13 @@
                       ch.qos.logback/logback-classic {:mvn/version "1.5.16"}}
          :extra-paths ["peer-resources"]
          :jvm-opts ["--enable-native-access=ALL-UNNAMED"]}
+  ;; Optional transit response formats (patternq.http/*format*)
+  :transit {:extra-deps {com.cognitect/transit-clj {:mvn/version "1.0.333"}}}
   :test {:extra-paths ["test"]
          :jvm-opts ["--enable-native-access=ALL-UNNAMED"]
          :extra-deps {io.github.cognitect-labs/test-runner
-                      {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+                      {:git/tag "v0.5.1" :git/sha "dfb30dd"}
+                      com.cognitect/transit-clj {:mvn/version "1.0.333"}}
          :main-opts ["-m" "cognitect.test-runner"]
          :exec-fn cognitect.test-runner.api/test}
   :fastmath {:extra-deps {generateme/fastmath {:mvn/version "2.4.0"

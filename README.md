@@ -71,6 +71,30 @@ back as doubles over HTTP (floats from the peer); relations are vectors over
 HTTP (sets from the peer); and the basis t in provenance is that of the
 latest query through a handle.
 
+#### Advanced: transit responses over HTTP
+
+Direct queries can also come back as transit: bind `patternq.http/*format*`
+to `:transit+json` or `:transit+msgpack` around any query or canned function.
+This needs transit-clj on the classpath (the `:transit` deps alias, or
+`com.cognitect/transit-clj` in your deps):
+
+```clojure
+(binding [patternq.http/*format* :transit+json]
+  (patternq.dataset/samples db))
+```
+
+Transit results are closer to the peer's than JSON results are:
+
+- instants are `java.util.Date` rather than ISO strings;
+- with `:transit+msgpack`, float attributes keep their stored 32-bit value;
+- strings that look like keywords stay strings.
+
+The transit formats always skip the S3 result cache. transit-clj decodes
+`:transit+json` about as fast as charred decodes JSON, and `:transit+msgpack`
+several times slower, so prefer `:transit+json`. Query time on the service
+usually dominates, and transit responses are not gzip-compressed (4–5× larger
+on the wire), so JSON stays the default.
+
 JDK 21+ prints netty warnings with the peer unless you add
 `--enable-native-access=ALL-UNNAMED` (the `:peer` and `:test` aliases do).
 
