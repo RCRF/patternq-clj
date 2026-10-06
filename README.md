@@ -71,6 +71,18 @@ back as doubles over HTTP (floats from the peer); relations are vectors over
 HTTP (sets from the peer); and the basis t in provenance is that of the
 latest query through a handle.
 
+#### Rate limits and retries over HTTP
+
+The commons API rate-limits each API key (600 requests a minute, at most 4 queries at once). When it throttles a call (HTTP 429 or 503), patternq waits as the server asks and retries, up to 5 times, and it waits out the rate limit instead of spending requests on refusals. Retries are logged at INFO on the `patternq` `System.Logger`, and a call still throttled
+after the last retry throws `ex-info` with `:patternq/throttled true`. A query that times out on the server is not
+retried: narrow it or page it (the server caps query timeouts at 120 s). Threads and futures share a limit of 4
+concurrent queries.
+
+```clojure
+(require '[patternq.backpressure :as bp])
+(bp/set-retry-policy! {:max-retries 8 :max-backoff 30})   ; defaults: 5, 60 s, :max-concurrency 4
+```
+
 #### Advanced: transit responses over HTTP
 
 Direct queries can also come back as transit: bind `patternq.http/*format*`

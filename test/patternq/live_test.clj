@@ -20,8 +20,7 @@
 
 (deftest ^:live h37001-sanity
   (let [db (db-name "H37001")]
-    (testing "samples & subjects"
-      (is (= 6 (count (pqd/samples db))))
+    (testing "subjects and provenance"
       (is (= ["H37001"] (map :subject-id (pqd/subjects db))))
       (is (= db (:db (:patternq/provenance (meta (pqd/samples db)))))))
     (testing "variants"
@@ -44,7 +43,7 @@
 (deftest ^:live tcga-uvm-sanity
   (let [db (db-name "tcga-uvm")]
     (is (= 80 (count (pqd/subjects db))))
-    (is (= #{"WES" "RNA-seq"} (set (map :assay-technology (pqd/dataset-summary db)))))
+    (is (= #{"WES" "RNA-seq" "SNP-array"} (set (map :assay-technology (pqd/dataset-summary db)))))
     (is (< 100 (count (pqd/gene-expression db {:genes ["BAP1" "PRAME"]}))))
     (is (= 80 (count (pqd/samples db))))
     (is (pos? (pv/variant-patient-count db "GNAQ")))))

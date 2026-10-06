@@ -12,8 +12,11 @@
   the Datomic peer's (\":ns/name\" strings -> keywords, find specs
   [?x ...] / ?x . / [?a ?b] reshaped client-side).
 
-  Only POST /query, POST /matrix and GET /api-v1/list are used: read-only."
+  Only POST /query, POST /matrix and GET /api-v1/list are used: read-only.
+  All of them follow the API back-pressure contract (patternq.backpressure):
+  throttled calls are retried, and the rate limit is waited out."
   (:require [charred.api :as json]
+            [patternq.backpressure :as bp]
             [clojure.string :as str]
             [clojure.walk :as walk])
   (:import (java.io ByteArrayInputStream InputStream)
@@ -65,7 +68,8 @@
                 (.timeout (Duration/ofSeconds 60))
                 (.GET)
                 (.build))
-        ^HttpResponse resp (.send client req (HttpResponse$BodyHandlers/ofString))]
+        ^HttpResponse resp (bp/send! #(.send client req (HttpResponse$BodyHandlers/ofString))
+                                     "Listing datasets" false)]
     (when-not (= 200 (.statusCode resp))
       (throw (ex-info (str "HTTP " (.statusCode resp) " from " path)
                       {:status (.statusCode resp) :body (.body resp)})))
@@ -115,7 +119,7 @@
                 (.timeout (Duration/ofSeconds 120))
                 (.POST (HttpRequest$BodyPublishers/ofString "{}"))
                 (.build))
-        ^HttpResponse resp (send! req (HttpResponse$BodyHandlers/ofString))]
+        ^HttpResponse resp (bp/send! #(send! req (HttpResponse$BodyHandlers/ofString)) "Matrix request" false)]
     (when-not (= 200 (.statusCode resp))
       (throw (ex-info (str "HTTP " (.statusCode resp) " requesting matrix") {:body (.body resp)})))
     (let [url (str/trim (str (.body resp)))
@@ -237,6 +241,25 @@
       (seq args) (assoc "args" (wire (vec args)))
       *refresh-cache* (assoc "refresh-cache" true))))
 
+(defn- warn-above-timeout-cap! []
+  (when (> (long *timeout-ms*) (long (bp/max-timeout-ms)))
+    (bp/log! :warning (format "patternq: *timeout-ms* %d is above the server's cap of %d s; the query will be canceled at the cap"
+                              (long *timeout-ms*) (quot (long (bp/max-timeout-ms)) 1000)))))
+
+(defn- throw-query-failed
+  "A non-200 query response: a server-side query timeout says to narrow or
+  page the query; everything else reports the status and body."
+  [status ^String body db]
+  (let [parsed (try (json/read-json body) (catch Exception _ nil))]
+    (if (and (map? parsed) (true? (get parsed "timeout")))
+      (throw (ex-info (format (str "Query timed out on the server: %s. Narrow the query or page it (e.g. fewer "
+                                   "args per call); the server caps query timeouts at %d s.")
+                              (get parsed "error") (quot (long (bp/max-timeout-ms)) 1000))
+                      {:status status :body body :db (:db-name db) :timeout true}))
+      (throw (ex-info (str "Query failed (HTTP " status "): " (or (when (map? parsed) (get parsed "error")) body))
+                      (cond-> {:status status :body body :db (:db-name db)}
+                        (map? parsed) (assoc :problem-type (get parsed "type"))))))))
+
 (defn- q-transit
   "Run a query with a transit response format (see *format*)."
   [query db args fmt]
@@ -251,12 +274,12 @@
                 (.timeout (Duration/ofMillis (+ (long *timeout-ms*) 60000)))
                 (.POST (HttpRequest$BodyPublishers/ofString body))
                 (.build))
-        ^HttpResponse resp (send! req (HttpResponse$BodyHandlers/ofByteArray))
+        _ (warn-above-timeout-cap!)
+        ^HttpResponse resp (bp/send! #(send! req (HttpResponse$BodyHandlers/ofByteArray)) "Query" true)
         ^bytes bs (.body resp)
         transit? (str/starts-with? (.orElse (.firstValue (.headers resp) "Content-Type") "") "application/transit")]
     (when-not (= 200 (.statusCode resp))
-      (throw (ex-info (str "Query failed (HTTP " (.statusCode resp) "): " (String. bs "UTF-8"))
-                      {:status (.statusCode resp) :body (String. bs "UTF-8") :db (:db-name db)})))
+      (throw-query-failed (.statusCode resp) (String. bs "UTF-8") db))
     (let [res (if transit? (read-transit bs fmt) (json/read-json (String. bs "UTF-8")))]
       (when-let [err (get res "error")]
         (throw (ex-info (str "Query error: " err) {:db (:db-name db) :error err})))
@@ -274,11 +297,11 @@
                 (.timeout (Duration/ofMillis (+ (long *timeout-ms*) 60000)))
                 (.POST (HttpRequest$BodyPublishers/ofString body))
                 (.build))
-        ^HttpResponse resp (send! req (HttpResponse$BodyHandlers/ofString))
+        _ (warn-above-timeout-cap!)
+        ^HttpResponse resp (bp/send! #(send! req (HttpResponse$BodyHandlers/ofString)) "Query" true)
         payload (str/trim (str (.body resp)))]
     (when-not (= 200 (.statusCode resp))
-      (throw (ex-info (str "Query failed (HTTP " (.statusCode resp) "): " payload)
-                      {:status (.statusCode resp) :body payload :db (:db-name db)})))
+      (throw-query-failed (.statusCode resp) payload db))
     (let [res (if (str/starts-with? payload "{")
                 (json/read-json payload)
                 (let [^HttpResponse data (send! (-> (HttpRequest/newBuilder (URI. payload)) (.GET) (.build))
