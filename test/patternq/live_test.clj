@@ -99,7 +99,7 @@
       (is (> (count cs2) (count cs))))
     (is (seq (pqd/isoforms db "TP53")))
     (is (seq (clinical/clinical-interventions db)))
-    (is (= 2 (count (pqd/measurement-matrices db))))
+    (is (= 6 (count (pqd/measurement-matrices db))))
     (is (seq (pqd/sgbs db "Taxa Abundance")))
     (is (seq (clinical/clinical-timeline db "H37004")))))
 

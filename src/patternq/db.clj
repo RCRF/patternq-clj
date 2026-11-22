@@ -163,6 +163,21 @@
       ((requiring-resolve 'patternq.http/q) (find-spec query) db args)
       (apply (peer-fn 'q) query db args))))
 
+(defn datoms
+  "Datoms of `index` (:eavt :aevt :avet :vaet) matching `components`, from
+  `offset`, at most `limit`, on either transport: a vector of {:e :a :v :tx}.
+  Reads an index range in bounded pages, so it is the way to walk a large set
+  of entities without binding them all in one query."
+  ([db-or-name index components] (datoms db-or-name index components {}))
+  ([db-or-name index components {:keys [offset limit] :or {offset 0 limit 1000} :as opts}]
+   (let [db (as-db db-or-name)]
+     (if (http-db? db)
+       ((requiring-resolve 'patternq.http/datoms) (:db-name db) index components opts)
+       (->> (apply (peer-fn 'datoms) db index components)
+            (drop offset)
+            (take limit)
+            (mapv (fn [d] {:e (:e d) :a (:a d) :v (:v d) :tx (:tx d)})))))))
+
 (defn pull-many
   "Pull `pattern` for entity ids `eids` (a vector of maps, in no particular
   order for HTTP; same order as eids for the peer)."

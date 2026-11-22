@@ -119,19 +119,82 @@
         [n v] (first r)]
     {:name n :version v}))
 
+;; A query that binds every measurement of a set (count, sample, [?m ?a]) makes
+;; the server hold the whole set in memory before any aggregate runs; on large
+;; expression sets that runs the service out of heap. The functions below read
+;; the set's measurement ids from the datoms index instead, in bounded pages,
+;; and query only those ids.
+(def ^:private page-size 10000) ; the server's datoms page cap; each page is also an audit write
+
+(defn- measurement-set-eids [db measurement-set]
+  (or (seq (pdb/q '[:find [?ms ...] :in $ ?ms-name :where [?ms :measurement-set/name ?ms-name]]
+                  db measurement-set))
+      (throw (ex-info (str "No measurement set named " (pr-str measurement-set))
+                      {:measurement-set measurement-set :db (pdb/db-name db)}))))
+
+(defn- set-measurement-ids
+  "Up to `limit` measurement ids of set `ms` in index order, starting at
+  `offset`: [ids complete?], complete? when they reach the end of the set."
+  ([db ms limit] (set-measurement-ids db ms limit 0))
+  ([db ms limit offset]
+   (loop [ids []]
+     (if (>= (count ids) limit)
+       [ids (empty? (pdb/datoms db :eavt [ms :measurement-set/measurements]
+                                {:offset (+ offset (count ids)) :limit 1}))]
+       (let [want (min page-size (- limit (count ids)))
+             page (pdb/datoms db :eavt [ms :measurement-set/measurements]
+                              {:offset (+ offset (count ids)) :limit want})
+             ids (into ids (map :v) page)]
+         (if (< (count page) want) [ids true] (recur ids)))))))
+
+(defn- count-set-measurements
+  "[count exact?]: the set's measurement count when it is at most `cap`, else
+  [cap false]. One page for a small set. A set filling the first page gets one
+  probe past the cap, then one-datom probes binary-search the 10000-wide block
+  it ends in, and one page of that block finishes the count: about six round
+  trips for any size, instead of a page per 10000."
+  [db ms cap]
+  (let [page (fn [offset limit] (count (pdb/datoms db :eavt [ms :measurement-set/measurements]
+                                                   {:offset offset :limit limit})))
+        step 10000
+        n (page 0 step)]
+    (cond
+      (< n step) [n true]
+      (pos? (page cap 1)) [cap false]
+      :else (loop [lo 1 hi (long (Math/ceil (/ cap step)))]
+              (if (> (- hi lo) 1)
+                (let [mid (quot (+ lo hi) 2)]
+                  (if (pos? (page (* mid step) 1)) (recur mid hi) (recur lo mid)))
+                [(+ (* lo step) (page (* lo step) step)) true])))))
+
 (defn measurement-sets
   "Measurement sets with assay and size: :assay-name, :assay-technology,
-  :measurement-set-name, :measurement-count."
-  [db-or-name]
-  (let [db (pdb/as-db db-or-name)
-        counts (into {} (pdb/q '[:find ?name (count ?m)
-                               :where
-                               [?ms :measurement-set/name ?name]
-                               [?ms :measurement-set/measurements ?m]]
-                             db))]
-    (provenanced (map #(assoc % :measurement-count (get counts (:measurement-set-name %) 0))
-                      (dataset-summary db))
-                 db (when (string? db-or-name) db-or-name))))
+  :measurement-set-name, :measurement-count, :measurement-count-exact.
+  Counting never binds a whole set in one query: a set with more than
+  :count-cap (default 100000) measurements reports :count-cap with
+  :measurement-count-exact false (read it as \"at least\")."
+  ([db-or-name] (measurement-sets db-or-name {}))
+  ([db-or-name {:keys [count-cap] :or {count-cap 100000}}]
+   (let [db (pdb/as-db db-or-name)
+         sets (vec (pdb/q '[:find ?ms ?name
+                            :where
+                            [?a :assay/measurement-sets ?ms]
+                            [?ms :measurement-set/name ?name]]
+                          db))
+         ;; one or two round trips per set, and a dataset can have dozens of
+         ;; sets: count them concurrently (back pressure still caps requests
+         ;; in flight)
+         found (mapv deref (mapv (fn [[ms]] (future (count-set-measurements db ms count-cap))) sets))
+         counts (reduce (fn [m [[_ nm] [n exact?]]]
+                          (let [[n0 e0] (get m nm [0 true])]
+                            (assoc m nm [(+ n0 n) (and e0 exact?)])))
+                        {}
+                        (map vector sets found))]
+     (provenanced (map (fn [{:keys [measurement-set-name] :as row}]
+                         (let [[n exact?] (get counts measurement-set-name [0 true])]
+                           (assoc row :measurement-count n :measurement-count-exact exact?)))
+                       (dataset-summary db))
+                  db (when (string? db-or-name) db-or-name)))))
 
 ;; Measurement target references: the entity a measurement is "of", and the
 ;; clauses naming it. Keys of results are the var names without "?".
@@ -161,35 +224,59 @@
   "Counts of every attribute across a measurement set's measurements: maps of
   :attribute (without namespace), :kind (\"value\" or \"target\"), :count.
   Sets can mix kinds of measurement, e.g. CyTOF populations with
-  percent-of-parent alongside population x marker median-channel-value."
-  [db-or-name measurement-set]
-  (let [[r db db-name] (run db-or-name '[:find ?attr (count ?m)
-                                         :in $ ?ms-name
-                                         :where
-                                         [?ms :measurement-set/name ?ms-name]
-                                         [?ms :measurement-set/measurements ?m]
-                                         [?m ?a]
-                                         [?a :db/ident ?attr]]
-                            [measurement-set])]
-    (provenanced (->> r
-                      (remove (comp #{:measurement/id :measurement/uid :measurement/sample} first))
-                      (map (fn [[a n]] {:attribute (name a)
-                                        :kind (if (contains? measurement-targets a) "target" "value")
-                                        :count n}))
-                      (sort-by (juxt :kind (comp - :count))))
-                 db db-name)))
+  percent-of-parent alongside population x marker median-channel-value.
+
+  Counts cover the set's first :limit (default 20000) measurements in index
+  order; (:patternq/exact (meta result)) is false when the set is larger, and
+  the counts are then a sample (kinds laid out after the first :limit can be
+  missed)."
+  ([db-or-name measurement-set] (measurement-types db-or-name measurement-set {}))
+  ([db-or-name measurement-set {:keys [limit] :or {limit 20000}}]
+   (let [db (pdb/as-db db-or-name)
+         scans (for [ms (measurement-set-eids db measurement-set)] (set-measurement-ids db ms limit))
+         exact? (every? second scans)
+         counts (apply merge-with +
+                       {}
+                       (for [[ids] scans
+                             chunk (partition-all page-size ids)]
+                         (into {} (pdb/q '[:find ?attr (count ?m)
+                                           :in $ [?m ...]
+                                           :where [?m ?a] [?a :db/ident ?attr]]
+                                         db (vec chunk)))))]
+     (vary-meta
+       (provenanced (->> counts
+                         (remove (comp #{:measurement/id :measurement/uid :measurement/sample} key))
+                         (map (fn [[a n]] {:attribute (name a)
+                                           :kind (if (contains? measurement-targets a) "target" "value")
+                                           :count n}))
+                         (sort-by (juxt :kind (comp - :count))))
+                    db (when (string? db-or-name) db-or-name))
+       assoc :patternq/exact exact?))))
 
 (defn measurement-set-attributes
-  "Attributes of a random sample of `:n` (default 200) measurements of a set,
-  optionally only those carrying `:measurement`. Cheap for big sets."
+  "Attributes of the set's first `:n` (default 200) measurements in index
+  order, optionally only those carrying `:measurement` (looked for among the
+  set's first 100000 measurements, the deepest the server pages by offset).
+  Reads bounded pages of the datoms index, so it stays cheap for sets with
+  millions of measurements."
   ([db-or-name measurement-set] (measurement-set-attributes db-or-name measurement-set {}))
   ([db-or-name measurement-set {:keys [measurement n] :or {n 200}}]
    (let [db (pdb/as-db db-or-name)
-         where (cond-> '[[?ms :measurement-set/name ?ms-name]
-                         [?ms :measurement-set/measurements ?m]]
-                 measurement (conj ['?m (measurement-attr measurement)]))
-         eids (pdb/q {:find [(list 'sample n '?m) '.] :in '[$ ?ms-name] :where where} db measurement-set)]
-     (->> (pdb/pull-many db '[*] (vec eids))
+         attr (when measurement (measurement-attr measurement))
+         carrying (fn [ids] (if (and attr (seq ids))
+                              (vec (pdb/q {:find '[[?m ...]] :in '[$ [?m ...]] :where [['?m attr]]} db ids))
+                              ids))
+         eids (->> (measurement-set-eids db measurement-set)
+                   (mapcat (fn [ms]
+                             (loop [found [] offset 0 pages 0]
+                               (let [[ids complete?] (set-measurement-ids db ms (if attr page-size n) offset)
+                                     found (into found (carrying ids))]
+                                 (if (or (>= (count found) n) complete? (nil? attr) (>= (inc pages) 10)) ; the server caps datoms offsets at 100000
+                                   found
+                                   (recur found (+ offset (count ids)) (inc pages)))))))
+                   (take n)
+                   vec)]
+     (->> (pdb/pull-many db '[*] eids)
           (mapcat keys)
           (remove #{:db/id :measurement/id :measurement/uid})
           distinct
@@ -244,26 +331,59 @@
      (provenanced (map (fn [row] (update (zipmap keys row) :value res/ident-name)) r)
                   db (when (string? db-or-name) db-or-name)))))
 
+(defn- sample-assays-by-walk
+  "sample-assays for a database from before :measurement-set/includes-samples:
+  walks each set's measurement -> sample refs."
+  [db smp]
+  (for [{:keys [measurement-set-name] :as ms} (dataset-summary db)
+        sid (pdb/q '[:find [?sample-id ...]
+                     :in $ ?ms-name
+                     :where
+                     [?ms :measurement-set/name ?ms-name]
+                     [?ms :measurement-set/measurements ?m]
+                     [?m :measurement/sample ?s]
+                     [?s :sample/id ?sample-id]]
+                   db measurement-set-name)]
+    (merge (select-keys (smp sid) [:subject-id :timepoint-id])
+           {:sample-id sid}
+           ms)))
+
+(def sample-assays-query
+  "Samples x measurement sets from :measurement-set/includes-samples, the
+  enrichment that lists each set's samples (schema 0.3.18), so nothing walks
+  the measurements."
+  '[:find ?sample-id ?assay-name ?assay-technology ?measurement-set-name
+    :where
+    [?a :assay/name ?assay-name]
+    [?a :assay/technology ?t]
+    [?t :db/ident ?assay-technology]
+    [?a :assay/measurement-sets ?ms]
+    [?ms :measurement-set/name ?measurement-set-name]
+    [?ms :measurement-set/includes-samples ?s]
+    [?s :sample/id ?sample-id]])
+
+(defn- includes-samples? [db]
+  (some? (pdb/q '[:find ?a . :in $ ?ident :where [?a :db/ident ?ident]]
+                db :measurement-set/includes-samples)))
+
 (defn sample-assays
   "Which samples were measured in which measurement sets: :subject-id,
   :sample-id, :timepoint-id, :assay-name, :assay-technology,
-  :measurement-set-name."
+  :measurement-set-name. Reads :measurement-set/includes-samples; a database
+  from before that enrichment falls back to walking each set's measurements,
+  which can time out on large expression sets."
   [db-or-name]
   (let [db (pdb/as-db db-or-name)
         smp (into {} (map (juxt :sample-id identity)) (samples db))]
     (provenanced
-      (for [{:keys [measurement-set-name] :as ms} (dataset-summary db)
-            sid (pdb/q '[:find [?sample-id ...]
-                       :in $ ?ms-name
-                       :where
-                       [?ms :measurement-set/name ?ms-name]
-                       [?ms :measurement-set/measurements ?m]
-                       [?m :measurement/sample ?s]
-                       [?s :sample/id ?sample-id]]
-                     db measurement-set-name)]
-        (merge (select-keys (smp sid) [:subject-id :timepoint-id])
-               {:sample-id sid}
-               ms))
+      (if (includes-samples? db)
+        (for [[sid a t ms] (pdb/q sample-assays-query db)]
+          (merge (select-keys (smp sid) [:subject-id :timepoint-id])
+                 {:sample-id sid
+                  :assay-name a
+                  :assay-technology (res/ident-name t)
+                  :measurement-set-name ms}))
+        (sample-assays-by-walk db smp))
       db (when (string? db-or-name) db-or-name))))
 
 (def measurement-matrices-query
@@ -304,14 +424,29 @@
                samples (conj (vec samples))
                genes (conj (vec genes))
                measurement-set (conj measurement-set))
-        where (cond-> '[[?m :measurement/vaf ?vaf]
+        ;; Datomic joins in clause order: start from the genes or the samples
+        ;; when given, not from every variant measurement in the database
+        where (cond
+                genes '[[?g :gene/hgnc-symbol ?gene]
+                        [?v :variant/gene ?g]
                         [?m :measurement/variant ?v]
+                        [?m :measurement/vaf ?vaf]
                         [?m :measurement/sample ?s]
                         [?s :sample/id ?sample-id]
                         [?ms :measurement-set/measurements ?m]
                         [?ms :measurement-set/name ?measurement-set]]
-                genes (into '[[?v :variant/gene ?g]
-                              [?g :gene/hgnc-symbol ?gene]]))]
+                samples '[[?s :sample/id ?sample-id]
+                          [?m :measurement/sample ?s]
+                          [?m :measurement/vaf ?vaf]
+                          [?m :measurement/variant ?v]
+                          [?ms :measurement-set/measurements ?m]
+                          [?ms :measurement-set/name ?measurement-set]]
+                :else '[[?m :measurement/vaf ?vaf]
+                        [?m :measurement/variant ?v]
+                        [?m :measurement/sample ?s]
+                        [?s :sample/id ?sample-id]
+                        [?ms :measurement-set/measurements ?m]
+                        [?ms :measurement-set/name ?measurement-set]])]
     {:query (into '[:find ?sample-id ?measurement-set ?vaf
                     (pull ?v [:variant/id :variant/HGVSp :variant/HGVSc
                               {:variant/gene [:gene/hgnc-symbol]}
@@ -367,15 +502,23 @@
                     :with ?m
                     :in]
                   (concat ins
-                          [:where
-                           '[?g :gene/hgnc-symbol ?hgnc-symbol]
-                           '[?gp :gene-product/gene ?g]
-                           '[?m :measurement/gene-product ?gp]
-                           ['?m attr '?value]
-                           '[?m :measurement/sample ?s]
-                           '[?s :sample/id ?sample-id]
-                           '[?ms :measurement-set/measurements ?m]
-                           '[?ms :measurement-set/name ?measurement-set]]))
+                          [:where]
+                          ;; samples without genes: start from the samples, not every gene
+                          (if (and samples (not genes))
+                            ['[?s :sample/id ?sample-id]
+                             '[?m :measurement/sample ?s]
+                             ['?m attr '?value]
+                             '[?m :measurement/gene-product ?gp]
+                             '[?gp :gene-product/gene ?g]
+                             '[?g :gene/hgnc-symbol ?hgnc-symbol]]
+                            ['[?g :gene/hgnc-symbol ?hgnc-symbol]
+                             '[?gp :gene-product/gene ?g]
+                             '[?m :measurement/gene-product ?gp]
+                             ['?m attr '?value]
+                             '[?m :measurement/sample ?s]
+                             '[?s :sample/id ?sample-id]])
+                          '[[?ms :measurement-set/measurements ?m]
+                            [?ms :measurement-set/name ?measurement-set]]))
      :args args}))
 
 (defn gene-expression
@@ -427,12 +570,17 @@
 
 (defn- subset-clauses
   "[ins args where] for optional :samples / :subjects filters; `where` binds
-  ?s (the sample entity)."
+  ?s (the sample entity), samples first."
   [{:keys [samples subjects]}]
   [(cond-> [] samples (conj '[?sample-id ...]) subjects (conj '[?subject-id ...]))
    (cond-> [] samples (conj (vec samples)) subjects (conj (vec subjects)))
-   (vec (concat (when subjects '[[?p :subject/id ?subject-id] [?s :sample/subject ?p]])
-                (when samples '[[?s :sample/id ?sample-id]])))])
+   (vec (concat (when samples '[[?s :sample/id ?sample-id]])
+                (when subjects '[[?p :subject/id ?subject-id] [?s :sample/subject ?p]])))])
+
+;; Starting from a few samples walks only their measurements. A subject can
+;; own most of a dataset (a single-participant deep dive has one subject and
+;; every sample), so subject-only CNV queries start from the measurement
+;; attribute instead.
 
 (defn cnv-segments-query
   [{:keys [genes] :as opts}]
@@ -451,10 +599,12 @@
                          (when genes '[[?hgnc-symbol ...]])
                          ins
                          [:where]
-                         ;; most selective subset first: genes, else samples/subjects
-                         (if genes
-                           (concat gene-where '[[?m :measurement/cnv ?c] [?m :measurement/sample ?s]] where)
-                           (concat where '[[?m :measurement/sample ?s] [?m :measurement/cnv ?c]]))
+                         ;; most selective subset first: genes, else samples, else the
+                         ;; CNV measurements themselves (subject-only)
+                         (cond
+                           genes (concat gene-where '[[?m :measurement/cnv ?c] [?m :measurement/sample ?s]] where)
+                           (:samples opts) (concat where '[[?m :measurement/sample ?s] [?m :measurement/cnv ?c]])
+                           :else (concat '[[?m :measurement/cnv ?c] [?m :measurement/sample ?s]] where))
                          '[[?c :cnv/id ?cnv-id]
                            [?s :sample/id ?sample-id]
                            [?ms :measurement-set/measurements ?m]
@@ -503,17 +653,23 @@
                        [:where]
                        ;; most selective subset first: genes (gene-level CNV sets are
                        ;; genes x samples), else samples/subjects
-                       (if genes
-                         (concat '[[?g :gene/hgnc-symbol ?hgnc-symbol]
-                                   [?gp :gene-product/gene ?g]
-                                   [?m :measurement/gene-product ?gp]
-                                   [?m :measurement/sample ?s]]
-                                 where)
-                         (concat where
-                                 '[[?m :measurement/sample ?s]
-                                   [?m :measurement/gene-product ?gp]
-                                   [?gp :gene-product/gene ?g]
-                                   [?g :gene/hgnc-symbol ?hgnc-symbol]]))
+                       (cond
+                         genes (concat '[[?g :gene/hgnc-symbol ?hgnc-symbol]
+                                         [?gp :gene-product/gene ?g]
+                                         [?m :measurement/gene-product ?gp]
+                                         [?m :measurement/sample ?s]]
+                                       where)
+                         (:samples opts) (concat where
+                                                 '[[?m :measurement/sample ?s]
+                                                   [?m :measurement/gene-product ?gp]
+                                                   [?gp :gene-product/gene ?g]
+                                                   [?g :gene/hgnc-symbol ?hgnc-symbol]])
+                         :else (concat [['?m attr (if enum? '?value-ref '?value)]]
+                                       '[[?m :measurement/sample ?s]]
+                                       where
+                                       '[[?m :measurement/gene-product ?gp]
+                                         [?gp :gene-product/gene ?g]
+                                         [?g :gene/hgnc-symbol ?hgnc-symbol]]))
                        [['?m attr (if enum? '?value-ref '?value)]]
                        '[[?s :sample/id ?sample-id]
                          [?ms :measurement-set/measurements ?m]

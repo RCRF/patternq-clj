@@ -129,6 +129,27 @@
           [header & rows] (json/read-csv text :separator \tab)]
       {:columns (vec header) :rows (vec rows)})))
 
+(defn datoms
+  "Raw datoms from an index (:eavt :aevt :avet :vaet) of database `db-name`
+  through the query service, from `offset`, at most `limit` (the service caps
+  it at 10000): a vector of {:e :a :v :tx}. Attributes come back as idents."
+  [db-name index components {:keys [offset limit] :or {offset 0 limit 1000}}]
+  (let [body (json/write-json-str {"index" (str index) "components" (mapv #(if (keyword? %) (str %) %) components)
+                                   "offset" offset "limit" limit})
+        req (-> (HttpRequest/newBuilder (URI. (str (endpoint) "/datoms/" db-name)))
+                (.header "Authorization" (str "Bearer " (api-token)))
+                (.header "Accept" "application/json")
+                (.header "Content-Type" "application/json")
+                (.timeout (Duration/ofSeconds 60))
+                (.POST (HttpRequest$BodyPublishers/ofString body))
+                (.build))
+        ^HttpResponse resp (bp/send! #(send! req (HttpResponse$BodyHandlers/ofString)) "Datoms request" true)]
+    (when-not (= 200 (.statusCode resp))
+      (throw (ex-info (str "Datoms request failed (HTTP " (.statusCode resp) "): " (.body resp))
+                      {:db db-name :status (.statusCode resp)})))
+    (mapv (fn [d] {:e (get d ":e") :a (get d ":a") :v (get d ":v") :tx (get d ":tx")})
+          (get (json/read-json (.body resp)) "datoms_chunk"))))
+
 ;; -- queries --
 
 (def ^:dynamic *timeout-ms*
