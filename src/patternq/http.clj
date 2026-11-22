@@ -129,13 +129,20 @@
           [header & rows] (json/read-csv text :separator \tab)]
       {:columns (vec header) :rows (vec rows)})))
 
+(defn- wire-components [components]
+  (mapv #(if (keyword? %) (str %) %) components))
+
 (defn datoms
   "Raw datoms from an index (:eavt :aevt :avet :vaet) of database `db-name`
-  through the query service, from `offset`, at most `limit` (the service caps
-  it at 10000): a vector of {:e :a :v :tx}. Attributes come back as idents."
-  [db-name index components {:keys [offset limit] :or {offset 0 limit 1000}}]
-  (let [body (json/write-json-str {"index" (str index) "components" (mapv #(if (keyword? %) (str %) %) components)
-                                   "offset" offset "limit" limit})
+  through the query service, from `offset` or, with `after`, from the cursor a
+  previous page returned (offsets past 100000 need it), at most `limit` (the
+  service caps it at 10000): a vector of {:e :a :v :tx}. Attributes come back
+  as idents. A service with cursor paging puts :patternq/cursor? true and
+  :patternq/next (the next page's cursor, nil at the end) on its metadata."
+  [db-name index components {:keys [offset limit after] :or {offset 0 limit 1000}}]
+  (let [body (json/write-json-str (merge {"index" (str index) "components" (wire-components components)
+                                          "limit" limit}
+                                         (if after {"after" after} {"offset" offset})))
         req (-> (HttpRequest/newBuilder (URI. (str (endpoint) "/datoms/" db-name)))
                 (.header "Authorization" (str "Bearer " (api-token)))
                 (.header "Accept" "application/json")
@@ -147,8 +154,37 @@
     (when-not (= 200 (.statusCode resp))
       (throw (ex-info (str "Datoms request failed (HTTP " (.statusCode resp) "): " (.body resp))
                       {:db db-name :status (.statusCode resp)})))
-    (mapv (fn [d] {:e (get d ":e") :a (get d ":a") :v (get d ":v") :tx (get d ":tx")})
-          (get (json/read-json (.body resp)) "datoms_chunk"))))
+    (let [res (json/read-json (.body resp))]
+      (with-meta (mapv (fn [d] {:e (get d ":e") :a (get d ":a") :v (get d ":v") :tx (get d ":tx")})
+                       (get res "datoms_chunk"))
+                 {:patternq/cursor? (contains? res "next") :patternq/next (get res "next")}))))
+
+(defonce ^:private count-unsupported (atom #{}))
+
+(defn datoms-count
+  "[count exact?] of the datoms in an index range of `db-name`, counted by the
+  service without transferring them (exact? false past `cap`), or nil when the
+  service can't count in place (before cursor paging). limit 1: such a service
+  answers with a one-datom page."
+  [db-name index components cap]
+  (when-not (contains? @count-unsupported (endpoint))
+    (let [body (json/write-json-str {"index" (str index) "components" (wire-components components)
+                                     "count" true "cap" cap "limit" 1})
+          req (-> (HttpRequest/newBuilder (URI. (str (endpoint) "/datoms/" db-name)))
+                  (.header "Authorization" (str "Bearer " (api-token)))
+                  (.header "Accept" "application/json")
+                  (.header "Content-Type" "application/json")
+                  (.timeout (Duration/ofSeconds 60))
+                  (.POST (HttpRequest$BodyPublishers/ofString body))
+                  (.build))
+          ^HttpResponse resp (bp/send! #(send! req (HttpResponse$BodyHandlers/ofString)) "Datoms count" true)]
+      (when-not (= 200 (.statusCode resp))
+        (throw (ex-info (str "Datoms count failed (HTTP " (.statusCode resp) "): " (.body resp))
+                        {:db db-name :status (.statusCode resp)})))
+      (let [res (json/read-json (.body resp))]
+        (if (contains? res "count")
+          [(long (get res "count")) (boolean (get res "exact" true))]
+          (do (swap! count-unsupported conj (endpoint)) nil))))))
 
 ;; -- queries --
 

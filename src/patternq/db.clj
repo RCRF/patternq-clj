@@ -173,10 +173,22 @@
    (let [db (as-db db-or-name)]
      (if (http-db? db)
        ((requiring-resolve 'patternq.http/datoms) (:db-name db) index components opts)
+       ;; the peer walks the index lazily and has no offset cap: no cursor
        (->> (apply (peer-fn 'datoms) db index components)
             (drop offset)
             (take limit)
             (mapv (fn [d] {:e (:e d) :a (:a d) :v (:v d) :tx (:tx d)})))))))
+
+(defn datoms-count
+  "[count exact?] of the datoms of `index` matching `components`, counting at
+  most `cap` (exact? false past it) without transferring them; nil when the
+  HTTP service can't count in place."
+  [db-or-name index components cap]
+  (let [db (as-db db-or-name)]
+    (if (http-db? db)
+      ((requiring-resolve 'patternq.http/datoms-count) (:db-name db) index components cap)
+      (let [n (bounded-count (inc cap) (apply (peer-fn 'datoms) db index components))]
+        [n (<= n cap)]))))
 
 (defn pull-many
   "Pull `pattern` for entity ids `eids` (a vector of maps, in no particular

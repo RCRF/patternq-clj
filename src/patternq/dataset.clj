@@ -132,49 +132,70 @@
       (throw (ex-info (str "No measurement set named " (pr-str measurement-set))
                       {:measurement-set measurement-set :db (pdb/db-name db)}))))
 
+(defn- set-page
+  "Up to `limit` measurement ids of set `ms` from `pos`: [ids next-pos],
+  next-pos nil at the end of the set. A position is [offset cursor]: the
+  cursor when the service pages by cursor, else the offset. A cursor page
+  answered without one (an instance from before cursor paging, during a
+  deploy or a rollback) is read again by offset, never repeated."
+  [db ms limit pos]
+  (let [[offset after] (if (vector? pos) pos [pos nil])
+        fetch (fn [opts] (pdb/datoms db :eavt [ms :measurement-set/measurements] (assoc opts :limit limit)))
+        page (if after
+               (let [p (fetch {:after after})]
+                 (if (:patternq/cursor? (meta p)) p (fetch {:offset offset})))
+               (fetch {:offset offset}))
+        ids (mapv :v page)
+        end (+ offset (count ids))]
+    [ids (if (:patternq/cursor? (meta page))
+           (when-let [nxt (:patternq/next (meta page))] [end nxt])
+           (when (= (count ids) limit) [end nil]))]))
+
 (defn- set-measurement-ids
-  "Up to `limit` measurement ids of set `ms` in index order, starting at
-  `offset`: [ids complete?], complete? when they reach the end of the set."
-  ([db ms limit] (set-measurement-ids db ms limit 0))
-  ([db ms limit offset]
-   (loop [ids []]
-     (if (>= (count ids) limit)
-       [ids (empty? (pdb/datoms db :eavt [ms :measurement-set/measurements]
-                                {:offset (+ offset (count ids)) :limit 1}))]
-       (let [want (min page-size (- limit (count ids)))
-             page (pdb/datoms db :eavt [ms :measurement-set/measurements]
-                              {:offset (+ offset (count ids)) :limit want})
-             ids (into ids (map :v) page)]
-         (if (< (count page) want) [ids true] (recur ids)))))))
+  "Up to `limit` measurement ids of set `ms` in index order: [ids complete?],
+  complete? when they reach the end of the set."
+  [db ms limit]
+  (loop [ids [] pos (identity 0)] ; boxed: pos becomes a cursor string
+    (if (>= (count ids) limit)
+      [ids (empty? (first (set-page db ms 1 pos)))]
+      (let [[got pos] (set-page db ms (min page-size (- limit (count ids))) pos)
+            ids (into ids got)]
+        (if (nil? pos) [ids true] (recur ids pos))))))
 
 (defn- count-set-measurements
   "[count exact?]: the set's measurement count when it is at most `cap`, else
-  [cap false]. One page for a small set. A set filling the first page gets one
+  [cap false]. Counted in place when the service (or the peer) can;
+  otherwise one page for a small set, and for a set filling the first page one
   probe past the cap, then one-datom probes binary-search the 10000-wide block
-  it ends in, and one page of that block finishes the count: about six round
+  it ends in and one page of that block finishes the count: about six round
   trips for any size, instead of a page per 10000."
   [db ms cap]
-  (let [page (fn [offset limit] (count (pdb/datoms db :eavt [ms :measurement-set/measurements]
-                                                   {:offset offset :limit limit})))
-        step 10000
-        n (page 0 step)]
-    (cond
-      (< n step) [n true]
-      (pos? (page cap 1)) [cap false]
-      :else (loop [lo 1 hi (long (Math/ceil (/ cap step)))]
-              (if (> (- hi lo) 1)
-                (let [mid (quot (+ lo hi) 2)]
-                  (if (pos? (page (* mid step) 1)) (recur mid hi) (recur lo mid)))
-                [(+ (* lo step) (page (* lo step) step)) true])))))
+  (if-let [[n exact?] (pdb/datoms-count db :eavt [ms :measurement-set/measurements] cap)]
+    (if (and exact? (<= n cap)) [n true] [cap false])
+    (let [cap (min cap 100000) ; the deepest offset paging goes
+          page (fn [offset limit] (count (pdb/datoms db :eavt [ms :measurement-set/measurements]
+                                                     {:offset offset :limit limit})))
+          step 10000
+          n (page 0 step)]
+      (cond
+        (< n step) [n true]
+        (pos? (page cap 1)) [cap false]
+        :else (loop [lo 1 hi (long (Math/ceil (/ cap step)))]
+                (if (> (- hi lo) 1)
+                  (let [mid (quot (+ lo hi) 2)]
+                    (if (pos? (page (* mid step) 1)) (recur mid hi) (recur lo mid)))
+                  [(+ (* lo step) (page (* lo step) step)) true]))))))
 
 (defn measurement-sets
   "Measurement sets with assay and size: :assay-name, :assay-technology,
   :measurement-set-name, :measurement-count, :measurement-count-exact.
   Counting never binds a whole set in one query: a set with more than
-  :count-cap (default 100000) measurements reports :count-cap with
-  :measurement-count-exact false (read it as \"at least\")."
+  :count-cap (default 1000000) measurements reports :count-cap with
+  :measurement-count-exact false (read it as \"at least\"). The service
+  counts in place; one without in-place counts is paged instead, capped at
+  100000 (the deepest it pages by offset)."
   ([db-or-name] (measurement-sets db-or-name {}))
-  ([db-or-name {:keys [count-cap] :or {count-cap 100000}}]
+  ([db-or-name {:keys [count-cap] :or {count-cap 1000000}}]
    (let [db (pdb/as-db db-or-name)
          sets (vec (pdb/q '[:find ?ms ?name
                             :where
@@ -268,12 +289,13 @@
                               ids))
          eids (->> (measurement-set-eids db measurement-set)
                    (mapcat (fn [ms]
-                             (loop [found [] offset 0 pages 0]
-                               (let [[ids complete?] (set-measurement-ids db ms (if attr page-size n) offset)
+                             (loop [found [] pos (identity 0) pages 0] ; boxed: pos becomes a cursor string
+                               (let [[ids pos] (set-page db ms (if attr page-size n) pos)
                                      found (into found (carrying ids))]
-                                 (if (or (>= (count found) n) complete? (nil? attr) (>= (inc pages) 10)) ; the server caps datoms offsets at 100000
+                                 ;; 100000 measurements at most, the service's offset cap
+                                 (if (or (>= (count found) n) (nil? pos) (nil? attr) (>= (inc pages) 10))
                                    found
-                                   (recur found (+ offset (count ids)) (inc pages)))))))
+                                   (recur found pos (inc pages)))))))
                    (take n)
                    vec)]
      (->> (pdb/pull-many db '[*] eids)
