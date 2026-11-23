@@ -145,13 +145,15 @@
   opts: :subjects"
   ([db-or-name] (clinical-interventions db-or-name {}))
   ([db-or-name {:keys [subjects]}]
+   (if-not (pqd/installed? db-or-name :clinical-intervention/subject)
+     (with-meta [] {})
    (let [rows (pqd/pull-rows db-or-name
                              (vec (concat [:find (list 'pull '?ci intervention-pattern) :in '$]
                                           (when subjects '[[?subject-id ...]])
                                           '[:where [?ci :clinical-intervention/subject ?p]
                                             [?p :subject/id ?subject-id]]))
                              (if subjects [(vec subjects)] []))]
-     (with-meta (mapv #(res/rename-prefix % "clinical-intervention-") rows) (meta rows)))))
+     (with-meta (mapv #(res/rename-prefix % "clinical-intervention-") rows) (meta rows))))))
 
 ;; -- clinical timeline --
 

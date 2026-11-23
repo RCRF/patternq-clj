@@ -479,9 +479,17 @@
     [?ms :measurement-set/includes-samples ?s]
     [?s :sample/id ?sample-id]])
 
+(defn installed?
+  "Whether every attribute in `idents` is installed in the database. A clause
+  on an attribute a database lacks fails the whole query (not-an-entity), so
+  calls check first and return no rows."
+  [db-or-name & idents]
+  (= (count (set idents))
+     (count (pdb/q '[:find [?ident ...] :in $ [?ident ...] :where [?a :db/ident ?ident]]
+                   (pdb/as-db db-or-name) (vec idents)))))
+
 (defn- includes-samples? [db]
-  (some? (pdb/q '[:find ?a . :in $ ?ident :where [?a :db/ident ?ident]]
-                db :measurement-set/includes-samples)))
+  (installed? db :measurement-set/includes-samples))
 
 (defn sample-assays
   "Which samples were measured in which measurement sets: :subject-id,
@@ -833,7 +841,10 @@
   :genes), :contig, :start, :end, :segment-mean-lrr, :absolute-cn (where
   present)."
   [db-or-name opts]
-  (if-let [routed (do (require-cnv-subset! opts) (route-subset cnv-segments db-or-name opts :measurement/cnv))]
+  (require-cnv-subset! opts)
+  (if-let [routed (if (or (::start opts) (installed? db-or-name :measurement/cnv))
+                    (route-subset cnv-segments db-or-name opts :measurement/cnv)
+                    (with-meta [] {}))]
     routed
   (let [{:keys [query args]} (cnv-segments-query opts)
         genes? (boolean (:genes opts))
@@ -861,7 +872,9 @@
   opts: :genes, :samples, :subjects, :measurement (default :cnv-call-score)"
   [db-or-name {:keys [genes measurement] :or {measurement :cnv-call-score} :as opts}]
   (require-cnv-subset! opts)
-  (if-let [routed (route-subset cnv-gene-calls db-or-name opts (measurement-attr measurement))]
+  (if-let [routed (if (or (::start opts) (installed? db-or-name (measurement-attr measurement)))
+                    (route-subset cnv-gene-calls db-or-name opts (measurement-attr measurement))
+                    (with-meta [] {}))]
     routed
   (let [attr (measurement-attr measurement)
         enum? (contains? enum-measurement-attrs attr)
@@ -883,9 +896,12 @@
                                          [?m :measurement/gene-product ?gp]
                                          [?m :measurement/sample ?s]]
                                        where)
+                         ;; the CNV attribute right after the sample, before the
+                         ;; per-row gene joins (a sample's measurements are every assay's)
                          (:samples opts) (concat where
-                                                 '[[?m :measurement/sample ?s]
-                                                   [?m :measurement/gene-product ?gp]
+                                                 '[[?m :measurement/sample ?s]]
+                                                 [['?m attr (if enum? '?value-ref '?value)]]
+                                                 '[[?m :measurement/gene-product ?gp]
                                                    [?gp :gene-product/gene ?g]
                                                    [?g :gene/hgnc-symbol ?hgnc-symbol]])
                          :else (concat [['?m attr (if enum? '?value-ref '?value)]]
