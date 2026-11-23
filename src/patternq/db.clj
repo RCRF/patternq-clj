@@ -169,12 +169,12 @@
   Reads an index range in bounded pages, so it is the way to walk a large set
   of entities without binding them all in one query."
   ([db-or-name index components] (datoms db-or-name index components {}))
-  ([db-or-name index components {:keys [offset limit] :or {offset 0 limit 1000} :as opts}]
+  ([db-or-name index components {:keys [offset limit seek] :or {offset 0 limit 1000} :as opts}]
    (let [db (as-db db-or-name)]
      (if (http-db? db)
        ((requiring-resolve 'patternq.http/datoms) (:db-name db) index components opts)
        ;; the peer walks the index lazily and has no offset cap: no cursor
-       (->> (apply (peer-fn 'datoms) db index components)
+       (->> (apply (peer-fn (if seek 'seek-datoms 'datoms)) db index components)
             (drop offset)
             (take limit)
             (mapv (fn [d] {:e (:e d) :a (:a d) :v (:v d) :tx (:tx d)})))))))

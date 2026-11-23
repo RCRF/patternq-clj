@@ -138,11 +138,14 @@
   previous page returned (offsets past 100000 need it), at most `limit` (the
   service caps it at 10000): a vector of {:e :a :v :tx}. Attributes come back
   as idents. A service with cursor paging puts :patternq/cursor? true and
-  :patternq/next (the next page's cursor, nil at the end) on its metadata."
-  [db-name index components {:keys [offset limit after] :or {offset 0 limit 1000}}]
+  :patternq/next (the next page's cursor, nil at the end) on its metadata.
+  :seek true starts at the first datom at or after `components` (which may run
+  past them into the next attribute or entity); seek pages have no cursor."
+  [db-name index components {:keys [offset limit after seek] :or {offset 0 limit 1000}}]
   (let [body (json/write-json-str (merge {"index" (str index) "components" (wire-components components)
                                           "limit" limit}
-                                         (if after {"after" after} {"offset" offset})))
+                                         (if after {"after" after} {"offset" offset})
+                                         (when seek {"seek" true})))
         req (-> (HttpRequest/newBuilder (URI. (str (endpoint) "/datoms/" db-name)))
                 (.header "Authorization" (str "Bearer " (api-token)))
                 (.header "Accept" "application/json")
@@ -158,6 +161,22 @@
       (with-meta (mapv (fn [d] {:e (get d ":e") :a (get d ":a") :v (get d ":v") :tx (get d ":tx")})
                        (get res "datoms_chunk"))
                  {:patternq/cursor? (contains? res "next") :patternq/next (get res "next")}))))
+
+(defn sample-index
+  "unify-central's stored sample index for `db-name` (which samples have data
+  in which measurement sets) as parsed JSON, or nil when the service doesn't
+  answer with a current copy (no copy, a stale one, or no such route). The
+  service never builds one on request."
+  [db-name]
+  (let [req (-> (HttpRequest/newBuilder (URI. (str (endpoint) "/sample-index/" db-name)))
+                (.header "Authorization" (str "Bearer " (api-token)))
+                (.header "Accept" "application/json")
+                (.timeout (Duration/ofSeconds 60))
+                (.GET)
+                (.build))
+        ^HttpResponse resp (bp/send! #(send! req (HttpResponse$BodyHandlers/ofString)) "Sample index" true)]
+    (when (= 200 (.statusCode resp))
+      (try (json/read-json (.body resp)) (catch Exception _ nil)))))
 
 (defonce ^:private count-unsupported (atom #{}))
 

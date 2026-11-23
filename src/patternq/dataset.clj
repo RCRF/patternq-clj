@@ -138,9 +138,10 @@
   cursor when the service pages by cursor, else the offset. A cursor page
   answered without one (an instance from before cursor paging, during a
   deploy or a rollback) is read again by offset, never repeated."
-  [db ms limit pos]
+  ([db ms limit pos] (set-page db ms limit pos :measurement-set/measurements))
+  ([db ms limit pos link]
   (let [[offset after] (if (vector? pos) pos [pos nil])
-        fetch (fn [opts] (pdb/datoms db :eavt [ms :measurement-set/measurements] (assoc opts :limit limit)))
+        fetch (fn [opts] (pdb/datoms db :eavt [ms link] (assoc opts :limit limit)))
         page (if after
                (let [p (fetch {:after after})]
                  (if (:patternq/cursor? (meta p)) p (fetch {:offset offset})))
@@ -149,7 +150,7 @@
         end (+ offset (count ids))]
     [ids (if (:patternq/cursor? (meta page))
            (when-let [nxt (:patternq/next (meta page))] [end nxt])
-           (when (= (count ids) limit) [end nil]))]))
+           (when (= (count ids) limit) [end nil]))])))
 
 (defn- set-measurement-ids
   "Up to `limit` measurement ids of set `ms` in index order: [ids complete?],
@@ -353,22 +354,116 @@
      (provenanced (map (fn [row] (update (zipmap keys row) :value res/ident-name)) r)
                   db (when (string? db-or-name) db-or-name)))))
 
-(defn- sample-assays-by-walk
-  "sample-assays for a database from before :measurement-set/includes-samples:
-  walks each set's measurement -> sample refs."
-  [db smp]
-  (for [{:keys [measurement-set-name] :as ms} (dataset-summary db)
-        sid (pdb/q '[:find [?sample-id ...]
-                     :in $ ?ms-name
-                     :where
-                     [?ms :measurement-set/name ?ms-name]
-                     [?ms :measurement-set/measurements ?m]
-                     [?m :measurement/sample ?s]
-                     [?s :sample/id ?sample-id]]
-                   db measurement-set-name)]
-    (merge (select-keys (smp sid) [:subject-id :timepoint-id])
-           {:sample-id sid}
-           ms)))
+(defn- sample-assays-from-index
+  "[sample-id assay-name assay-technology measurement-set-name] rows from
+  unify-central's stored sample index, or nil when the service has no current
+  copy (or the transport is the peer)."
+  [db]
+  (when-let [index (and (pdb/http-db? db) ((requiring-resolve 'patternq.http/sample-index) (pdb/db-name db)))]
+    (let [sets (get index "measurement_sets") smp (get index "samples")]
+      (vec (for [[ms ks] (get index "set_samples")
+                 k ks
+                 :when (and (get smp k) (get sets ms))]
+             [(get-in smp [k "id"]) (get-in sets [ms "assay"]) (get-in sets [ms "assay_type"])
+              (get-in sets [ms "name"])])))))
+
+(def ^:private set-links
+  "The links from a measurement set to its samples: the set's ref to its
+  members, and each member's ref to its sample. Matrices list their samples
+  directly."
+  [[:measurement-set/measurements :measurement/sample]
+   [:measurement-set/single-cells :single-cell/sample]])
+
+(def ^:private seek-steps 8)
+
+(defn- attr=
+  "Whether a datom's attribute (a keyword from the peer, \":ns/name\" over
+  HTTP) is `link`."
+  [a link]
+  (= (if (keyword? a) a (keyword (subs (str a) 1))) link))
+
+(defn- seek1 [db index components]
+  (first (pdb/datoms db index components {:seek true :limit 1})))
+
+(defn- last-member
+  "The highest member id of set `ms` through `link`: one offset read for a set
+  within the service's offset cap, else seeks, doubling then halving the
+  distance from `lo` (each seek lands on the first member at or past an id)."
+  [db ms link lo]
+  (let [[n exact?] (pdb/datoms-count db :eavt [ms link] 100001)]
+    (if (and n exact?)
+      (:v (first (pdb/datoms db :eavt [ms link] {:offset (dec n) :limit 1})))
+      (let [at (fn [x] (let [d (seek1 db :eavt [ms link x])]
+                         (when (and d (attr= (:a d) link) (= (:e d) ms)) (:v d))))
+            high (loop [low lo step 1]
+                   (if-let [v (at (+ lo step))] (recur v (* 2 step)) [low (+ lo step)]))]
+        (loop [[low high] high]
+          (if (> (- high low) 1)
+            (let [mid (quot (+ low high) 2)]
+              (if-let [v (at mid)] (recur [v high]) (recur [low mid])))
+            low))))))
+
+(defn- sample-assays-by-seek
+  "[sample-id assay-name assay-technology measurement-set-name] rows for a
+  database without :measurement-set/includes-samples or a stored sample index,
+  from datoms seeks only: no query binds a set's or a sample's measurements.
+  For each set its first and last member ids; then for each sample and set, a
+  seek into the sample's members (VAET) at the set's first id, and one lookup
+  of the hit's sets. Sets' ids interleave, so a hit in another set (which it
+  also records) moves the seek past it, up to seek-steps times; past that, one
+  query settles that sample alone. About two requests per sample and set, each
+  also an audit write on the service: slow on a large cohort, but it never
+  walks the data."
+  [db]
+  (let [meta (pdb/q '[:find ?ms ?assay-name ?assay-technology ?measurement-set-name
+                      :where [?a :assay/name ?assay-name] [?a :assay/technology ?t]
+                      [?t :db/ident ?assay-technology] [?a :assay/measurement-sets ?ms]
+                      [?ms :measurement-set/name ?measurement-set-name]]
+                    db)
+        sample-id (into {} (pdb/q '[:find ?s ?sample-id :where [?s :sample/id ?sample-id]] db))
+        ranges (vec (for [[ms] meta
+                          [set-link sample-link] set-links
+                          :let [lo (:v (first (pdb/datoms db :eavt [ms set-link] {:limit 1})))]
+                          :when lo]
+                      {:ms ms :set-link set-link :sample-link sample-link :lo lo
+                       :hi (last-member db ms set-link lo)}))
+        from-matrices (for [[ms] meta
+                            mm (map :v (pdb/datoms db :eavt [ms :measurement-set/measurement-matrices] {:limit 10000}))
+                            s (loop [acc [] pos (identity 0)] ; boxed: pos becomes [offset cursor]
+                                (let [[got nxt] (set-page db mm 10000 pos :measurement-matrix/samples)
+                                      acc (into acc got)]
+                                  (if nxt (recur acc nxt) acc)))]
+                        [ms s])
+        owners (fn [m set-link] (mapv :e (pdb/datoms db :vaet [m set-link] {:limit 100})))
+        check (fn [s]
+                (reduce (fn [hits {:keys [ms set-link sample-link lo hi]}]
+                          (if (hits ms)
+                            hits
+                            (loop [pos (long lo) k 0 hits hits]
+                              (if (>= k seek-steps)
+                                (cond-> hits
+                                  (seq (pdb/q {:find '[?m] :in '[$ ?s ?ms]
+                                               :where [['?m sample-link '?s] ['?ms set-link '?m]]}
+                                              db s ms))
+                                  (conj ms))
+                                (let [d (seek1 db :vaet [s sample-link pos])]
+                                  (if (or (nil? d) (not (attr= (:a d) sample-link)) (not= (:v d) s) (> (:e d) hi))
+                                    hits
+                                    (let [of (owners (:e d) set-link)
+                                          hits (into hits of)]
+                                      (if (some #{ms} of) hits (recur (inc (long (:e d))) (inc k) hits)))))))))
+                        #{} ranges))
+        members (reduce (fn [acc [ms s]] (update acc ms (fnil conj #{}) s))
+                        {}
+                        (concat from-matrices
+                                (for [[s hits] (map vector (keys sample-id)
+                                                    (mapv deref (mapv #(future (check %)) (keys sample-id))))
+                                      ms hits]
+                                  [ms s])))]
+    (vec (for [[ms a t n] meta
+               s (get members ms)
+               :when (sample-id s)]
+           [(sample-id s) a (res/ident-name t) n]))))
 
 (def sample-assays-query
   "Samples x measurement sets from :measurement-set/includes-samples, the
@@ -391,21 +486,22 @@
 (defn sample-assays
   "Which samples were measured in which measurement sets: :subject-id,
   :sample-id, :timepoint-id, :assay-name, :assay-technology,
-  :measurement-set-name. Reads :measurement-set/includes-samples; a database
-  from before that enrichment falls back to walking each set's measurements,
-  which can time out on large expression sets."
+  :measurement-set-name. Reads :measurement-set/includes-samples. A database
+  without it uses unify-central's stored sample index when the service has a
+  current copy, else datoms seeks: slow on a large cohort (about two requests
+  per sample and set), but no query walks the measurements."
   [db-or-name]
   (let [db (pdb/as-db db-or-name)
         smp (into {} (map (juxt :sample-id identity)) (samples db))]
     (provenanced
-      (if (includes-samples? db)
-        (for [[sid a t ms] (pdb/q sample-assays-query db)]
-          (merge (select-keys (smp sid) [:subject-id :timepoint-id])
-                 {:sample-id sid
-                  :assay-name a
-                  :assay-technology (res/ident-name t)
-                  :measurement-set-name ms}))
-        (sample-assays-by-walk db smp))
+      (for [[sid a t ms] (if (includes-samples? db)
+                           (pdb/q sample-assays-query db)
+                           (or (sample-assays-from-index db) (sample-assays-by-seek db)))]
+        (merge (select-keys (smp sid) [:subject-id :timepoint-id])
+               {:sample-id sid
+                :assay-name a
+                :assay-technology (res/ident-name t)
+                :measurement-set-name ms}))
       db (when (string? db-or-name) db-or-name))))
 
 (def measurement-matrices-query
@@ -433,6 +529,95 @@
                  db db-name)))
 
 ;; -- variants --
+
+(def ^:private samples-per-query
+  "Without genes, a sample-subset call returns whole samples' worth of rows
+  (every gene's expression or CNV call): one /query per this many samples, so
+  no single query holds more on the server."
+  2)
+
+;; A set's first measurement id, cached (a database name pins an immutable
+;; database).
+(defonce ^:private first-measurements (atom {}))
+
+(defn- first-measurement [db ms]
+  (let [k [(pdb/db-name db) ms]]
+    (if (contains? @first-measurements k)
+      (@first-measurements k)
+      (let [v (:v (first (pdb/datoms db :eavt [ms :measurement-set/measurements] {:limit 1})))]
+        (when (pdb/db-name db) (swap! first-measurements assoc k v))
+        v))))
+
+(defn- sets-carrying
+  "The sets in `sets` holding `attr` measurements, judged by each set's first
+  measurement (a set holds one kind of measurement): one datoms page per set
+  (cached), then one query over those measurements."
+  [db attr sets]
+  (let [firsts (mapv deref (mapv #(future (first-measurement db %)) sets))
+        hit (set (when-let [ids (seq (remove nil? firsts))]
+                   (pdb/q {:find '[[?m ...]] :in '[$ [?m ...]] :where [['?m attr]]} db (vec ids))))]
+    (vec (keep (fn [[ms f]] (when (and f (hit f)) ms)) (map vector sets firsts)))))
+
+(def ^:private set-walk-cap
+  "Walking more set measurements than this is never the cheaper start."
+  2000000)
+
+(defn- cnv-plan
+  "How a CNV subset query should run: [:empty] when no `attr` set includes the
+  samples; [:sets sets] to walk just those sets' measurements; [:samples sets]
+  to walk the samples' measurements, restricted to those sets.
+  :measurement-set/includes-samples (schema 0.3.18) names the sets holding
+  each sample; the service counts both walks in place, and the smaller one
+  wins. A database without the enrichment walks the samples."
+  [db attr sample-ids]
+  (if-not (includes-samples? db)
+    [:samples nil]
+    (let [r (pdb/q '[:find ?s ?ms :in $ [?sample-id ...]
+                     :where [?s :sample/id ?sample-id] [?ms :measurement-set/includes-samples ?s]]
+                   db (vec sample-ids))
+          sets (if (seq r) (sets-carrying db attr (vec (sort (distinct (map second r))))) [])]
+      (if (empty? sets)
+        [:empty]
+        (let [counts (map #(pdb/datoms-count db :eavt [% :measurement-set/measurements] set-walk-cap) sets)]
+          (if (some #(or (nil? %) (not (second %))) counts)
+            [:samples sets]
+            (let [in-sets (reduce + (map first counts))]
+              (loop [[e & more] (sort (distinct (map first r))) walked 0]
+                (cond
+                  (nil? e) [:samples sets]
+                  :else (let [n (pdb/datoms-count db :vaet [e :measurement/sample] (inc in-sets))
+                              walked (+ walked (long (if n (first n) (inc in-sets))))]
+                          (if (> walked in-sets) [:sets sets] (recur more walked))))))))))))
+
+(defn- route-subset
+  "How a subset call should run, or nil to run it as is. CNV calls (`attr`
+  given) without genes resolve subjects to their samples, then run by
+  cnv-plan; other sample-subset calls without genes run in chunks of
+  samples-per-query samples. `f` is the call itself."
+  [f db-or-name {:keys [genes samples subjects ::start] :as opts} attr]
+  (let [chunks (fn [ids opts]
+                 (let [parts (mapv #(f db-or-name (assoc opts :samples (vec %))) (partition-all samples-per-query ids))]
+                   (with-meta (vec (apply concat parts)) (meta (first parts)))))]
+    (cond
+      (or genes start) nil
+      attr
+      (let [db (pdb/as-db db-or-name)
+            ids (if samples
+                  (vec samples)
+                  (vec (sort (pdb/q '[:find [?sample-id ...]
+                                      :in $ [?subject-id ...]
+                                      :where [?p :subject/id ?subject-id] [?s :sample/subject ?p]
+                                      [?s :sample/id ?sample-id]]
+                                    db (vec subjects)))))]
+        (if (empty? ids)
+          (with-meta [] {})
+          (let [[start sets] (cnv-plan db attr ids)
+                opts (assoc opts ::start start ::sets sets)]
+            (cond
+              (= start :empty) (with-meta [] {})
+              (and (= start :samples) (> (count ids) samples-per-query)) (chunks ids opts)
+              :else (f db-or-name (assoc opts :samples ids))))))
+      (> (count samples) samples-per-query) (chunks samples (assoc opts ::start :samples)))))
 
 (defn variants-query
   "Query and args for variant measurements, optionally restricted to
@@ -487,6 +672,8 @@
   opts: :samples, :genes, :measurement-set"
   ([db-or-name] (variants db-or-name {}))
   ([db-or-name opts]
+   (if-let [routed (route-subset variants db-or-name opts nil)]
+     routed
    (let [{:keys [query args]} (variants-query opts)
          [r db db-name] (run db-or-name query args)]
      (provenanced
@@ -502,7 +689,7 @@
                          :vaf vaf}
                   (:measurement/t-depth m) (assoc :t-depth (:measurement/t-depth m)))))
             r)
-       db db-name))))
+       db db-name)))))
 
 ;; -- gene expression --
 
@@ -550,9 +737,11 @@
   opts: :genes, :samples, :measurement (default :tpm), :measurement-set"
   ([db-or-name] (gene-expression db-or-name {}))
   ([db-or-name opts]
+   (if-let [routed (route-subset gene-expression db-or-name opts nil)]
+     routed
    (let [{:keys [query args]} (gene-expression-query opts)
          [r db db-name] (run db-or-name query args)]
-     (provenanced (res/rows->maps [:sample-id :hgnc-symbol :measurement-set :value] r) db db-name))))
+     (provenanced (res/rows->maps [:sample-id :hgnc-symbol :measurement-set :value] r) db db-name)))))
 
 (defn isoforms
   "Isoform-level expression for a gene: :sample-id, :transcript-id,
@@ -620,18 +809,22 @@
                            :in $]
                          (when genes '[[?hgnc-symbol ...]])
                          ins
+                         (when (seq (::sets opts)) '[[?ms ...]])
                          [:where]
-                         ;; most selective subset first: genes, else samples, else the
-                         ;; CNV measurements themselves (subject-only)
+                         ;; the subset first: genes, else the planned sets or samples
+                         ;; (see cnv-plan)
                          (cond
                            genes (concat gene-where '[[?m :measurement/cnv ?c] [?m :measurement/sample ?s]] where)
+                           (= :sets (::start opts))
+                           (concat '[[?ms :measurement-set/measurements ?m] [?m :measurement/cnv ?c]
+                                     [?m :measurement/sample ?s]] where)
                            (:samples opts) (concat where '[[?m :measurement/sample ?s] [?m :measurement/cnv ?c]])
                            :else (concat '[[?m :measurement/cnv ?c] [?m :measurement/sample ?s]] where))
                          '[[?c :cnv/id ?cnv-id]
                            [?s :sample/id ?sample-id]
                            [?ms :measurement-set/measurements ?m]
                            [?ms :measurement-set/name ?measurement-set]]))
-     :args (vec (concat (when genes [(vec genes)]) args))}))
+     :args (vec (concat (when genes [(vec genes)]) args (when (seq (::sets opts)) [(vec (::sets opts))])))}))
 
 (defn cnv-segments
   "Copy number segments per sample (segment-level CNV measurements) with the
@@ -640,6 +833,8 @@
   :genes), :contig, :start, :end, :segment-mean-lrr, :absolute-cn (where
   present)."
   [db-or-name opts]
+  (if-let [routed (do (require-cnv-subset! opts) (route-subset cnv-segments db-or-name opts :measurement/cnv))]
+    routed
   (let [{:keys [query args]} (cnv-segments-query opts)
         genes? (boolean (:genes opts))
         [r db db-name] (run db-or-name query args)]
@@ -655,7 +850,7 @@
                               (into {} (map (fn [[k v]] [(keyword (name k)) v])) m))
                  genes? (assoc :hgnc-symbol hgnc))))
            r)
-      db db-name)))
+      db db-name))))
 
 (defn cnv-gene-calls
   "Gene-level copy number calls (e.g. GISTIC2 discrete calls
@@ -666,16 +861,23 @@
   opts: :genes, :samples, :subjects, :measurement (default :cnv-call-score)"
   [db-or-name {:keys [genes measurement] :or {measurement :cnv-call-score} :as opts}]
   (require-cnv-subset! opts)
+  (if-let [routed (route-subset cnv-gene-calls db-or-name opts (measurement-attr measurement))]
+    routed
   (let [attr (measurement-attr measurement)
         enum? (contains? enum-measurement-attrs attr)
         [ins args where] (subset-clauses opts)
         q (vec (concat '[:find ?sample-id ?measurement-set ?hgnc-symbol ?value :with ?m :in $]
                        (when genes '[[?hgnc-symbol ...]])
                        ins
+                       (when (seq (::sets opts)) '[[?ms ...]])
                        [:where]
-                       ;; most selective subset first: genes (gene-level CNV sets are
-                       ;; genes x samples), else samples/subjects
+                       ;; the subset first: genes (gene-level CNV sets are genes x
+                       ;; samples), else the planned sets or samples (see cnv-plan)
                        (cond
+                         (and (not genes) (= :sets (::start opts)))
+                         (concat '[[?ms :measurement-set/measurements ?m] [?m :measurement/sample ?s]] where
+                                 '[[?m :measurement/gene-product ?gp] [?gp :gene-product/gene ?g]
+                                   [?g :gene/hgnc-symbol ?hgnc-symbol]])
                          genes (concat '[[?g :gene/hgnc-symbol ?hgnc-symbol]
                                          [?gp :gene-product/gene ?g]
                                          [?m :measurement/gene-product ?gp]
@@ -697,11 +899,12 @@
                          [?ms :measurement-set/measurements ?m]
                          [?ms :measurement-set/name ?measurement-set]]
                        (when enum? '[[?value-ref :db/ident ?value]])))
-        [r db db-name] (run db-or-name q (vec (concat (when genes [(vec genes)]) args)))]
+        [r db db-name] (run db-or-name q (vec (concat (when genes [(vec genes)]) args
+                                                      (when (seq (::sets opts)) [(vec (::sets opts))]))))]
     (provenanced (map #(update (zipmap [:sample-id :measurement-set :hgnc-symbol :value] %)
                                :value res/ident-name)
                       r)
-                 db db-name)))
+                 db db-name))))
 
 (comment
   (str/join ", " (map :measurement-set-name (dataset-summary "H37001-2026-09-21a"))))

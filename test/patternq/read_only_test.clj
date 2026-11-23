@@ -14,7 +14,7 @@
 (def forbidden-peer
   #"\b(d|datomic\.api)/(transact|transact-async|create-database|delete-database|rename-database|request-index|gc-storage|sync-excise)\b|\"(transact|transact-async|create-database|delete-database|rename-database|request-index|gc-storage|sync-excise)\"")
 
-(def peer-whitelist #{"q" "datoms" "connect" "db" "pull" "pull-many" "basis-t" "release"})
+(def peer-whitelist #{"q" "datoms" "seek-datoms" "connect" "db" "pull" "pull-many" "basis-t" "release"})
 
 (deftest no-state-changing-datomic-calls
   (doseq [[path src] (sources)]
@@ -37,6 +37,6 @@
         paths (map second (re-seq #"\"(/[a-z0-9/-]+)" src))]
     (is (seq paths))
     (doseq [p paths]
-      (is (some #(.startsWith ^String p %) ["/query/" "/datoms/" "/matrix/" "/api-v1/list/"])
+      (is (some #(.startsWith ^String p %) ["/query/" "/datoms/" "/matrix/" "/sample-index/" "/api-v1/list/"])
           (str "http.clj uses endpoint " p)))
     (is (not (re-find #"(?i)transact|\"DELETE\"|\.DELETE|\.PUT" src)))))
